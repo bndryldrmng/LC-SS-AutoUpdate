@@ -1,3 +1,9 @@
+Automatically bundles LiveContainer nightly with the latest SideStore Nightly release!
+By changing the action build wget link to the Nightly release on Sidestore's own repo, it now builds using that one instead of the outdated nightly build in livecontainer's repository.
+Former commits show the Original repo actually doing this, but later modified to use their own build which seems to remove alternative app icons and actally preferring remote pairing instead of the lockdown one. <b>Be sure to use remote pairing for the setup!</b>
+
+
+
 <div align="center">
    <img width="217" height="217" src="./screenshots/livecontainer_icon.png" alt="Logo">
 </div>
