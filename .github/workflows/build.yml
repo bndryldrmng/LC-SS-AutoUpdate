@@ -3,16 +3,72 @@ name: Xcode - Build
 on: 
   push:
   pull_request:
+  schedule:
+    - cron: '17 * * * *'
   workflow_dispatch:
     inputs: 
       release__nightly:
         description: Create a nightly release
         type: boolean
         required: false
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sidestore-build-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
+  check_sidestore:
+    name: Check official SideStore nightly
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.check.outputs.build }}
+      marker: ${{ steps.check.outputs.marker }}
+      sha256: ${{ steps.check.outputs.sha256 }}
+    steps:
+      - name: Compare with the last published bundle
+        id: check
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { data: upstream } = await github.rest.repos.getReleaseByTag({
+              owner: 'SideStore', repo: 'SideStore', tag: 'nightly'
+            });
+            const asset = upstream.assets.find(a => a.name === 'SideStore.ipa' && a.state === 'uploaded');
+            if (!asset || !Number.isSafeInteger(asset.id)) {
+              throw new Error('The official SideStore nightly IPA is unavailable.');
+            }
+            if (asset.digest && !/^sha256:[a-f0-9]{64}$/.test(asset.digest)) {
+              throw new Error('Unexpected SideStore asset digest.');
+            }
+            const fingerprint = `${asset.id}:${asset.digest || asset.updated_at}:${asset.size}`;
+            const marker = `<!-- sidestore-build:${fingerprint}:${context.sha} -->`;
+            let previous;
+            try {
+              ({ data: previous } = await github.rest.repos.getReleaseByTag({
+                ...context.repo, tag: 'nightly'
+              }));
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+            const published = previous && !previous.draft &&
+              (previous.body || '').includes(marker) &&
+              previous.assets.some(a => a.name === 'LiveContainer+SideStore.ipa' && a.state === 'uploaded');
+            const shouldBuild = context.eventName !== 'schedule' || !published;
+            core.setOutput('build', String(shouldBuild));
+            core.setOutput('marker', marker);
+            core.setOutput('sha256', asset.digest ? asset.digest.slice(7) : '');
+            await core.summary.addHeading('Official SideStore nightly')
+              .addRaw(shouldBuild ? 'Building and packaging the current nightly.' : 'The published bundle is already up to date.')
+              .addLink('SideStore release', upstream.html_url).write();
+
   build:
     name: Build using xcodebuild command
+    needs: check_sidestore
+    if: needs.check_sidestore.outputs.build == 'true'
     runs-on: macos-latest
     env:
       scheme: LiveContainer
@@ -70,6 +126,17 @@ jobs:
         run: |
           sh .github/build_github.sh
 
+      - name: Verify the downloaded SideStore and finished IPA
+        env:
+          SIDESTORE_SHA256: ${{ needs.check_sidestore.outputs.sha256 }}
+        run: |
+          if [ -n "$SIDESTORE_SHA256" ]; then
+            printf '%s  %s\n' "$SIDESTORE_SHA256" tmp/SideStore.ipa | shasum -a 256 --check
+          fi
+          unzip -tq "$scheme+SideStore.ipa"
+          test -f Payload/LiveContainer.app/Frameworks/SideStoreApp.framework/SideStore
+          test -f Payload/LiveContainer.app/PlugIns/LiveWidgetExtension.appex/LiveWidgetExtension
+
       - name: Upload a Build Artifact
         uses: actions/upload-artifact@v7
         with:
@@ -86,16 +153,16 @@ jobs:
     name: Nightly Release
     permissions:
       contents: write
-    if: inputs.release__nightly || github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    if: inputs.release__nightly || github.event_name == 'schedule' || github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
-    needs: [build]
+    needs: [build, check_sidestore]
     concurrency:
       group: release__nightly
       cancel-in-progress: true
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v6
       - name: Download a Build Artifact
         uses: actions/download-artifact@v8
         with:
@@ -111,6 +178,8 @@ jobs:
           COMMIT_MSG=$(git log -1 --pretty=%s)
           echo "COMMIT_SHA=$COMMIT_SHA" >> $GITHUB_ENV
           echo "COMMIT_MSG=$COMMIT_MSG" >> $GITHUB_ENV
+      - name: Install source update dependencies
+        run: python -m pip install requests
       - name: Update AltStore source
         id: update_source
         env:
@@ -142,3 +211,18 @@ jobs:
             .github/apps_ss_lc.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Record the successfully published SideStore build
+        uses: actions/github-script@v8
+        env:
+          SIDESTORE_BUILD_MARKER: ${{ needs.check_sidestore.outputs.marker }}
+        with:
+          script: |
+            const { data: release } = await github.rest.repos.getReleaseByTag({
+              ...context.repo, tag: 'nightly'
+            });
+            const body = (release.body || '').replace(/\n?<!-- sidestore-build:[^\n]*-->/g, '');
+            await github.rest.repos.updateRelease({
+              ...context.repo, release_id: release.id,
+              body: `${body}\n\nUses the [official SideStore nightly](https://github.com/SideStore/SideStore/releases/tag/nightly).\n${process.env.SIDESTORE_BUILD_MARKER}`
+            });
